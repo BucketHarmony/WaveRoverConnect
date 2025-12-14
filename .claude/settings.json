@@ -1,0 +1,14 @@
+{
+  "project": {
+    "name": "WAVE ROVER Controller",
+    "description": "Python Wi-Fi controller and motion test suite for Waveshare WAVE ROVER"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python wave_rover_controller.py*)",
+      "Bash(pip install*)",
+      "Bash(pip list*)",
+      "Bash(git *)"
+    ]
+  }
+}
