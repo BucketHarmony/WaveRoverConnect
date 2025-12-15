@@ -43,7 +43,7 @@ import requests
 # =============================================================================
 
 # Default rover settings
-DEFAULT_AP_IP = "192.168.4.1"
+DEFAULT_AP_IP = "192.168.4.115"
 DEFAULT_AP_SSID = "UGV"
 DEFAULT_AP_PASSWORD = "12345678"
 
@@ -142,11 +142,12 @@ class MotionPrimitive:
 class RoverClient:
     """HTTP client for communicating with the WAVE ROVER."""
 
-    def __init__(self, ip: str, timeout: float = HTTP_TIMEOUT, logger: Optional[logging.Logger] = None):
+    def __init__(self, ip: str, timeout: float = HTTP_TIMEOUT, logger: Optional[logging.Logger] = None, verbose: bool = False):
         self.ip = ip
         self.base_url = f"http://{ip}"
         self.timeout = timeout
         self.logger = logger or logging.getLogger("wave_rover")
+        self.verbose = verbose
         self._session = requests.Session()
 
     def send_command(self, command: dict, retries: int = MAX_RETRIES) -> CommandResult:
@@ -160,15 +161,25 @@ class RoverClient:
 
         start_time = time.perf_counter()
 
+        # Verbose logging - request details
+        if self.verbose:
+            self.logger.info(f">>> SEND: {json_str}")
+            self.logger.debug(f">>> URL:  {url}")
+
         for attempt in range(retries):
             try:
                 response = self._session.get(url, timeout=self.timeout)
                 latency_ms = (time.perf_counter() - start_time) * 1000
 
-                self.logger.debug(
-                    f"Command: {json_str} -> HTTP {response.status_code} "
-                    f"({latency_ms:.1f}ms)"
-                )
+                # Verbose logging - response details
+                if self.verbose:
+                    self.logger.info(f"<<< RECV: HTTP {response.status_code} ({latency_ms:.1f}ms)")
+                    self.logger.info(f"<<< BODY: {response.text[:500] if response.text else '(empty)'}")
+                else:
+                    self.logger.debug(
+                        f"Command: {json_str} -> HTTP {response.status_code} "
+                        f"({latency_ms:.1f}ms)"
+                    )
 
                 return CommandResult(
                     success=response.status_code == 200,
@@ -180,10 +191,16 @@ class RoverClient:
 
             except requests.exceptions.Timeout:
                 self.logger.warning(f"Timeout on attempt {attempt + 1}/{retries}")
+                if self.verbose:
+                    self.logger.warning(f"<<< TIMEOUT after {self.timeout}s")
             except requests.exceptions.ConnectionError as e:
                 self.logger.warning(f"Connection error on attempt {attempt + 1}/{retries}: {e}")
+                if self.verbose:
+                    self.logger.warning(f"<<< CONNECTION ERROR: {e}")
             except Exception as e:
                 self.logger.error(f"Unexpected error: {e}")
+                if self.verbose:
+                    self.logger.error(f"<<< EXCEPTION: {type(e).__name__}: {e}")
                 return CommandResult(
                     success=False,
                     command=command,
@@ -357,6 +374,101 @@ class MotionController:
 
 
 # =============================================================================
+# Network Scanner
+# =============================================================================
+
+def scan_for_rover(ip: str, timeout: float = 0.5) -> Optional[dict]:
+    """
+    Check if a rover exists at the given IP address.
+
+    Returns rover info dict if found, None otherwise.
+    """
+    try:
+        url = f"http://{ip}/js?json={quote(json.dumps({'T': 130}))}"
+        response = requests.get(url, timeout=timeout)
+
+        if response.status_code == 200:
+            # Try to parse response as JSON to verify it's a rover
+            try:
+                data = json.loads(response.text)
+                # Check if it looks like a valid rover response (has expected fields)
+                if isinstance(data, dict) and 'T' in data:
+                    return {
+                        "ip": ip,
+                        "response": data,
+                        "voltage": data.get("v"),
+                        "temperature": data.get("temp")
+                    }
+            except json.JSONDecodeError:
+                pass
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+        pass
+    except Exception:
+        pass
+
+    return None
+
+
+def scan_network(
+    subnet: str,
+    timeout: float = 0.5,
+    max_workers: int = 50,
+    logger: Optional[logging.Logger] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None
+) -> list[dict]:
+    """
+    Scan a /24 subnet for WAVE ROVER devices.
+
+    Args:
+        subnet: Base subnet (e.g., "192.168.1" or "192.168.1.0")
+        timeout: Connection timeout per IP in seconds
+        max_workers: Number of concurrent scanner threads
+        logger: Logger instance
+        progress_callback: Called with (current, total, ip) for progress updates
+
+    Returns:
+        List of dicts with info about found rovers
+    """
+    import concurrent.futures
+
+    logger = logger or logging.getLogger("wave_rover")
+
+    # Parse subnet - handle both "192.168.1" and "192.168.1.0" formats
+    subnet_base = subnet.rsplit('.', 1)[0] if subnet.count('.') == 3 else subnet
+
+    # Generate all 256 IPs to scan
+    ips_to_scan = [f"{subnet_base}.{i}" for i in range(256)]
+
+    found_rovers = []
+    scanned = 0
+
+    def scan_ip(ip: str) -> Optional[dict]:
+        nonlocal scanned
+        result = scan_for_rover(ip, timeout)
+        scanned += 1
+        if progress_callback:
+            progress_callback(scanned, 256, ip)
+        return result
+
+    # Use thread pool for concurrent scanning
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all scan tasks
+        future_to_ip = {executor.submit(scan_ip, ip): ip for ip in ips_to_scan}
+
+        # Collect results as they complete
+        for future in concurrent.futures.as_completed(future_to_ip):
+            try:
+                result = future.result()
+                if result:
+                    found_rovers.append(result)
+                    logger.info(f"Found rover at {result['ip']}!")
+            except Exception as e:
+                logger.debug(f"Error scanning: {e}")
+
+    return found_rovers
+
+
+# =============================================================================
 # Provisioning
 # =============================================================================
 
@@ -366,7 +478,8 @@ def provision_sta(
     sta_password: str,
     ap_ssid: str = DEFAULT_AP_SSID,
     ap_password: str = DEFAULT_AP_PASSWORD,
-    logger: Optional[logging.Logger] = None
+    logger: Optional[logging.Logger] = None,
+    reboot: bool = True
 ) -> bool:
     """
     Configure the rover to connect to a Wi-Fi network in STA mode.
@@ -375,41 +488,128 @@ def provision_sta(
     After successful configuration, the rover will connect to the specified
     Wi-Fi network and its IP will be shown on the OLED "ST" line.
 
-    Command: {"T":404,"ap_ssid":"...","ap_password":"...","sta_ssid":"...","sta_password":"..."}
+    Command sequence:
+    1. T:401 - Set WiFi mode to AP+STA (cmd=3)
+    2. T:404 - Set AP and STA credentials
+    3. T:600 - Reboot ESP32 (optional)
     """
     logger = logger or logging.getLogger("wave_rover")
 
-    command = {
+    logger.info("=" * 60)
+    logger.info("STEP 1: Set WiFi mode to AP+STA")
+    logger.info("=" * 60)
+
+    # T:401 - Set WiFi mode on boot: 0=off, 1=AP, 2=STA, 3=AP+STA
+    wifi_mode_cmd = {"T": 401, "cmd": 3}
+    result = client.send_command(wifi_mode_cmd)
+    if not result.success:
+        logger.error(f"Failed to set WiFi mode: {result.error_message}")
+        return False
+    logger.info(f"WiFi mode set to AP+STA (response: {result.response_body})")
+
+    time.sleep(0.5)
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("STEP 2: Configure WiFi credentials")
+    logger.info("=" * 60)
+    logger.info(f"  AP SSID: {ap_ssid}")
+    logger.info(f"  STA SSID: {sta_ssid}")
+
+    # T:404 - Set both AP and STA credentials
+    credentials_cmd = {
         "T": 404,
         "ap_ssid": ap_ssid,
         "ap_password": ap_password,
         "sta_ssid": sta_ssid,
         "sta_password": sta_password
     }
+    result = client.send_command(credentials_cmd)
+    if not result.success:
+        logger.error(f"Failed to set credentials: {result.error_message}")
+        return False
+    logger.info(f"Credentials configured (response: {result.response_body})")
 
-    logger.info(f"Sending STA provisioning command...")
-    logger.info(f"  AP SSID: {ap_ssid}")
-    logger.info(f"  STA SSID: {sta_ssid}")
+    time.sleep(0.5)
 
-    result = client.send_command(command)
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("STEP 3: Query WiFi info to verify")
+    logger.info("=" * 60)
 
+    # T:405 - Get current WiFi info
+    info_cmd = {"T": 405}
+    result = client.send_command(info_cmd)
     if result.success:
-        logger.info("Provisioning command sent successfully!")
+        logger.info(f"WiFi info: {result.response_body}")
+    else:
+        logger.warning(f"Could not query WiFi info: {result.error_message}")
+
+    if reboot:
+        time.sleep(0.5)
+
         logger.info("")
         logger.info("=" * 60)
-        logger.info("NEXT STEPS:")
+        logger.info("STEP 4: Rebooting ESP32")
         logger.info("=" * 60)
-        logger.info("1. The rover will reboot and connect to your Wi-Fi network")
-        logger.info("2. Check the rover's OLED display for the 'ST' line")
-        logger.info("3. Note the IP address shown on the 'ST' line")
-        logger.info("4. Connect your computer back to your normal Wi-Fi")
-        logger.info("5. Run: python wave_rover_controller.py ping --ip <ST_IP>")
-        logger.info("6. Run: python wave_rover_controller.py run-motion-suite --ip <ST_IP>")
-        logger.info("=" * 60)
+
+        # T:600 - Reboot ESP32
+        reboot_cmd = {"T": 600}
+        result = client.send_command(reboot_cmd, retries=1)
+        # Note: Reboot may not return a response as the device restarts immediately
+        logger.info("Reboot command sent")
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("PROVISIONING COMPLETE - NEXT STEPS:")
+    logger.info("=" * 60)
+    logger.info("1. Wait for the rover to reboot (~10 seconds)")
+    logger.info("2. Check the rover's OLED display for the 'ST' line")
+    logger.info("3. Note the IP address shown on the 'ST' line")
+    logger.info("4. Connect your computer back to your normal Wi-Fi")
+    logger.info("5. Run: python wave_rover_controller.py ping --ip <ST_IP>")
+    logger.info("6. Run: python wave_rover_controller.py run-motion-suite --ip <ST_IP>")
+    logger.info("=" * 60)
+    return True
+
+
+def get_wifi_info(client: RoverClient, logger: Optional[logging.Logger] = None) -> Optional[str]:
+    """Query current WiFi information from the rover (T:405)."""
+    logger = logger or logging.getLogger("wave_rover")
+    result = client.send_command({"T": 405})
+    if result.success:
+        return result.response_body
+    logger.error(f"Failed to get WiFi info: {result.error_message}")
+    return None
+
+
+def set_wifi_mode(client: RoverClient, mode: int, logger: Optional[logging.Logger] = None) -> bool:
+    """
+    Set WiFi mode on boot (T:401).
+
+    Modes:
+        0 = WiFi off
+        1 = AP mode only
+        2 = STA mode only
+        3 = AP+STA mode
+    """
+    logger = logger or logging.getLogger("wave_rover")
+    result = client.send_command({"T": 401, "cmd": mode})
+    if result.success:
+        logger.info(f"WiFi mode set to {mode} (response: {result.response_body})")
         return True
-    else:
-        logger.error(f"Provisioning failed: {result.error_message}")
-        return False
+    logger.error(f"Failed to set WiFi mode: {result.error_message}")
+    return False
+
+
+def reboot_rover(client: RoverClient, logger: Optional[logging.Logger] = None) -> bool:
+    """Reboot the ESP32 (T:600)."""
+    logger = logger or logging.getLogger("wave_rover")
+    logger.info("Sending reboot command...")
+    result = client.send_command({"T": 600}, retries=1)
+    # Device may not respond as it reboots immediately
+    logger.info("Reboot command sent (device may not respond)")
+    return True
 
 
 # =============================================================================
@@ -661,12 +861,349 @@ class MotionTestSuite:
 
 
 # =============================================================================
+# Automated Test Suite (No User Input)
+# =============================================================================
+
+def run_automated_test(
+    controller: MotionController,
+    speed: float = DEFAULT_TEST_SPEED,
+    duration: float = DEFAULT_MOTION_DURATION,
+    settle_delay: float = DEFAULT_SETTLE_DELAY,
+    logger: Optional[logging.Logger] = None,
+    skip_heartbeat: bool = False
+) -> list[dict]:
+    """
+    Run a fully automated motion test suite with no user input required.
+
+    Displays all commands and status in real-time to the console.
+    Returns a list of test results.
+    """
+    logger = logger or logging.getLogger("wave_rover")
+    results = []
+
+    # Define test sequence
+    # Spin turns need decent power but not too much
+    spin_speed = 0.35
+
+    # Arc turns need big speed differential and higher power to overcome friction
+    arc_fast = 0.4   # Fast wheel
+    arc_slow = 0.08  # Slow wheel (almost stopped to force arc)
+
+    tests = [
+        {"name": "STOP", "left": 0, "right": 0, "duration": 1.0,
+         "desc": "Baseline stop - wheels should not move"},
+        {"name": "FORWARD", "left": speed, "right": speed, "duration": duration,
+         "desc": "Both wheels forward at same speed"},
+        {"name": "REVERSE", "left": -speed, "right": -speed, "duration": duration,
+         "desc": "Both wheels backward at same speed"},
+        {"name": "SPIN CLOCKWISE", "left": spin_speed, "right": -spin_speed, "duration": duration,
+         "desc": f"Rotate in place clockwise ({spin_speed} m/s)"},
+        {"name": "SPIN COUNTER-CW", "left": -spin_speed, "right": spin_speed, "duration": duration,
+         "desc": f"Rotate in place counter-clockwise ({spin_speed} m/s)"},
+        {"name": "ARC LEFT", "left": arc_slow, "right": arc_fast, "duration": duration,
+         "desc": f"Curve left (L={arc_slow}, R={arc_fast} m/s)"},
+        {"name": "ARC RIGHT", "left": arc_fast, "right": arc_slow, "duration": duration,
+         "desc": f"Curve right (L={arc_fast}, R={arc_slow} m/s)"},
+        {"name": "STOP", "left": 0, "right": 0, "duration": 1.0,
+         "desc": "Final stop"},
+    ]
+
+    # Print header
+    print()
+    print("=" * 70)
+    print("  AUTOMATED MOTION TEST SUITE - NO INPUT REQUIRED")
+    print("=" * 70)
+    print(f"  Speed: {speed} m/s | Duration: {duration}s | Settle: {settle_delay}s")
+    print(f"  Tests: {len(tests)} motion primitives" + (" + heartbeat test" if not skip_heartbeat else ""))
+    print("=" * 70)
+    print()
+    print("  Press Ctrl+C at any time to emergency stop")
+    print()
+    time.sleep(2)  # Give user time to read
+
+    try:
+        for i, test in enumerate(tests, 1):
+            # Announce test
+            print()
+            print("-" * 70)
+            print(f"  [{i}/{len(tests)}] {test['name']}")
+            print(f"  {test['desc']}")
+            print(f"  Command: L={test['left']:.3f} m/s, R={test['right']:.3f} m/s, Duration={test['duration']}s")
+            print("-" * 70)
+
+            # Countdown
+            print("  Starting in: ", end="", flush=True)
+            for countdown in [3, 2, 1]:
+                print(f"{countdown}...", end="", flush=True)
+                time.sleep(0.5)
+            print(" GO!")
+
+            # Execute motion
+            start_time = time.time()
+            commands_sent, avg_rate = controller.run_motion(
+                test["left"], test["right"], test["duration"]
+            )
+            elapsed = time.time() - start_time
+
+            # Report results
+            print(f"  ✓ Complete | Sent {commands_sent} commands | Rate: {avg_rate:.1f} Hz | Time: {elapsed:.2f}s")
+
+            results.append({
+                "name": test["name"],
+                "left": test["left"],
+                "right": test["right"],
+                "duration": test["duration"],
+                "commands_sent": commands_sent,
+                "avg_rate_hz": avg_rate,
+                "elapsed": elapsed,
+                "success": True
+            })
+
+            # Settle delay
+            if settle_delay > 0 and i < len(tests):
+                print(f"  Settling for {settle_delay}s...")
+                time.sleep(settle_delay)
+
+        # Speed ramp test
+        print()
+        print("-" * 70)
+        print(f"  [RAMP] SPEED RAMP TEST")
+        print(f"  Gradually increasing then decreasing speed")
+        print("-" * 70)
+
+        ramp_speeds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.20, 0.15, 0.10, 0.05]
+        step_duration = 0.8
+
+        print("  Starting in: ", end="", flush=True)
+        for countdown in [3, 2, 1]:
+            print(f"{countdown}...", end="", flush=True)
+            time.sleep(0.5)
+        print(" GO!")
+
+        controller.start_keepalive()
+        ramp_start = time.time()
+
+        try:
+            for spd in ramp_speeds:
+                print(f"  → Speed: {spd:.2f} m/s")
+                controller.set_speed(spd, spd)
+                time.sleep(step_duration)
+        finally:
+            controller.stop_keepalive()
+            controller.stop()
+
+        ramp_elapsed = time.time() - ramp_start
+        ramp_cmds, ramp_rate = controller.get_statistics()
+        print(f"  ✓ Ramp complete | Sent {ramp_cmds} commands | Rate: {ramp_rate:.1f} Hz | Time: {ramp_elapsed:.2f}s")
+
+        results.append({
+            "name": "SPEED_RAMP",
+            "speeds": ramp_speeds,
+            "commands_sent": ramp_cmds,
+            "avg_rate_hz": ramp_rate,
+            "elapsed": ramp_elapsed,
+            "success": True
+        })
+
+        # Heartbeat validation test
+        if not skip_heartbeat:
+            print()
+            print("-" * 70)
+            print(f"  [SAFETY] HEARTBEAT VALIDATION TEST")
+            print(f"  Will start moving, then STOP sending commands")
+            print(f"  Rover should auto-stop within ~3 seconds")
+            print("-" * 70)
+
+            print("  Starting in: ", end="", flush=True)
+            for countdown in [3, 2, 1]:
+                print(f"{countdown}...", end="", flush=True)
+                time.sleep(0.5)
+            print(" GO!")
+
+            # Start moving
+            print(f"  → Moving forward at {speed} m/s...")
+            controller.set_speed(speed, speed)
+            controller.start_keepalive()
+            time.sleep(1.5)
+
+            # Stop sending commands (but don't send stop)
+            print(f"  → STOPPING command transmission (NOT sending stop)...")
+            controller.stop_keepalive()
+
+            # Wait and observe
+            print(f"  → Waiting for auto-stop (should happen within ~3s)...")
+            for sec in range(5):
+                time.sleep(1)
+                print(f"    {sec + 1}s elapsed...")
+
+            # Now send explicit stop
+            controller.stop()
+            print(f"  ✓ Heartbeat test complete - check if rover stopped automatically")
+
+            results.append({
+                "name": "HEARTBEAT_VALIDATION",
+                "success": True,
+                "note": "Manual verification required"
+            })
+
+        # Final stop
+        controller.stop()
+
+    except KeyboardInterrupt:
+        print()
+        print("  !!! INTERRUPTED - Emergency stopping !!!")
+        controller.e_stop()
+        raise
+    except Exception as e:
+        print(f"  !!! ERROR: {e} !!!")
+        controller.e_stop()
+        raise
+
+    # Print summary
+    print()
+    print("=" * 70)
+    print("  TEST SUMMARY")
+    print("=" * 70)
+
+    total_commands = sum(r.get("commands_sent", 0) for r in results)
+    total_time = sum(r.get("elapsed", 0) for r in results)
+
+    for r in results:
+        status = "✓" if r.get("success") else "✗"
+        if "commands_sent" in r:
+            print(f"  {status} {r['name']}: {r['commands_sent']} cmds, {r.get('avg_rate_hz', 0):.1f} Hz")
+        else:
+            print(f"  {status} {r['name']}: {r.get('note', 'OK')}")
+
+    print("-" * 70)
+    print(f"  Total: {len(results)} tests | {total_commands} commands | {total_time:.1f}s runtime")
+    print("=" * 70)
+    print()
+
+    return results
+
+
+# =============================================================================
 # CLI Interface
 # =============================================================================
 
+def cmd_auto_test(args, logger):
+    """Run the fully automated motion test suite."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+    controller = MotionController(client, logger=logger)
+
+    # Set up signal handler for Ctrl+C
+    def signal_handler(sig, frame):
+        print("\n  !!! Ctrl+C - Emergency stopping !!!")
+        controller.e_stop()
+        sys.exit(1)
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    # Test connectivity first
+    logger.info(f"Testing connectivity to {args.ip}...")
+    if not client.ping():
+        logger.error("Cannot connect to rover. Check IP address and network connection.")
+        return 1
+    logger.info("Connection successful!")
+
+    try:
+        run_automated_test(
+            controller,
+            speed=args.speed,
+            duration=args.duration,
+            settle_delay=args.settle_delay,
+            logger=logger,
+            skip_heartbeat=args.skip_heartbeat
+        )
+    except KeyboardInterrupt:
+        logger.warning("Test interrupted")
+    except Exception as e:
+        logger.error(f"Error during test: {e}")
+        controller.e_stop()
+        raise
+    finally:
+        controller.stop()
+        client.close()
+
+    return 0
+
+
+def cmd_scan(args, logger):
+    """Scan a subnet for WAVE ROVER devices."""
+    subnet = args.subnet
+    timeout = args.timeout
+    workers = args.workers
+
+    print()
+    print("=" * 60)
+    print("  WAVE ROVER NETWORK SCANNER")
+    print("=" * 60)
+    print(f"  Subnet: {subnet}.0/24 (256 addresses)")
+    print(f"  Timeout: {timeout}s per IP")
+    print(f"  Workers: {workers} concurrent connections")
+    print("=" * 60)
+    print()
+
+    # Progress tracking
+    last_percent = -1
+
+    def progress_callback(current: int, total: int, ip: str):
+        nonlocal last_percent
+        percent = (current * 100) // total
+        if percent != last_percent and percent % 10 == 0:
+            print(f"  Scanning... {percent}% ({current}/{total})")
+            last_percent = percent
+
+    print("  Starting scan...")
+    start_time = time.time()
+
+    rovers = scan_network(
+        subnet=subnet,
+        timeout=timeout,
+        max_workers=workers,
+        logger=logger,
+        progress_callback=progress_callback
+    )
+
+    elapsed = time.time() - start_time
+
+    print()
+    print("=" * 60)
+    print("  SCAN RESULTS")
+    print("=" * 60)
+    print(f"  Scanned 256 addresses in {elapsed:.1f}s")
+    print()
+
+    if rovers:
+        print(f"  Found {len(rovers)} rover(s):")
+        print()
+        for rover in rovers:
+            print(f"    IP: {rover['ip']}")
+            if rover.get('voltage'):
+                print(f"        Voltage: {rover['voltage']}V")
+            if rover.get('temperature'):
+                print(f"        Temperature: {rover['temperature']}°C")
+            print()
+    else:
+        print("  No rovers found on this subnet.")
+        print()
+        print("  Tips:")
+        print("    - Make sure the rover is powered on")
+        print("    - Check if you're on the same network as the rover")
+        print("    - Try scanning the rover's AP subnet: 192.168.4")
+        print()
+
+    print("=" * 60)
+    print()
+
+    return 0 if rovers else 1
+
+
 def cmd_ping(args, logger):
     """Test connectivity to the rover."""
-    client = RoverClient(args.ip, logger=logger)
+    client = RoverClient(args.ip, logger=logger, verbose=getattr(args, 'verbose', False))
 
     logger.info(f"Pinging rover at {args.ip}...")
 
@@ -678,10 +1215,138 @@ def cmd_ping(args, logger):
         return 1
 
 
+def cmd_status(args, logger):
+    """Get battery level and status information from the rover."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    print()
+    print("=" * 60)
+    print("  WAVE ROVER STATUS")
+    print("=" * 60)
+
+    # Status commands to query
+    status_commands = [
+        {"T": 130, "name": "Chassis/Battery Info", "desc": "CMD_BASE_FEEDBACK"},
+        {"T": 126, "name": "IMU Data", "desc": "CMD_GET_IMU_DATA"},
+        {"T": 405, "name": "WiFi Info", "desc": "CMD_WIFI_INFO"},
+        {"T": 302, "name": "MAC Address", "desc": "CMD_GET_MAC_ADDRESS"},
+        {"T": 601, "name": "Flash Space", "desc": "CMD_FREE_FLASH_SPACE"},
+    ]
+
+    results = {}
+
+    for cmd_info in status_commands:
+        cmd = {"T": cmd_info["T"]}
+        print()
+        print(f"  [{cmd_info['name']}] ({cmd_info['desc']})")
+        print(f"  Request: {json.dumps(cmd)}")
+
+        result = client.send_command(cmd, retries=1)
+
+        if result.success:
+            response = result.response_body
+            results[cmd_info["name"]] = response
+
+            # Try to parse as JSON for pretty printing
+            try:
+                data = json.loads(response)
+                print(f"  Response: {json.dumps(data, indent=4)}")
+
+                # Extract and highlight key values if present
+                if isinstance(data, dict):
+                    # Look for common battery/voltage fields
+                    for key in ['v', 'V', 'voltage', 'Voltage', 'bat', 'battery', 'Battery']:
+                        if key in data:
+                            print(f"  >>> VOLTAGE: {data[key]}")
+                    # Look for IMU data
+                    for key in ['r', 'p', 'y', 'roll', 'pitch', 'yaw']:
+                        if key in data:
+                            print(f"  >>> {key.upper()}: {data[key]}")
+
+            except json.JSONDecodeError:
+                # Not JSON, print raw (truncated if long)
+                if len(response) > 200:
+                    print(f"  Response: {response[:200]}...")
+                else:
+                    print(f"  Response: {response}")
+        else:
+            print(f"  ERROR: {result.error_message}")
+            results[cmd_info["name"]] = None
+
+    print()
+    print("=" * 60)
+    print()
+
+    client.close()
+    return 0
+
+
+def cmd_battery(args, logger):
+    """Get just the battery/chassis info (quick check)."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    # CMD_BASE_FEEDBACK - gets chassis info including voltage
+    result = client.send_command({"T": 130}, retries=2)
+
+    if result.success:
+        print()
+        print("Battery/Chassis Info:")
+        print("-" * 40)
+
+        try:
+            data = json.loads(result.response_body)
+            print(json.dumps(data, indent=2))
+
+            # Try to extract voltage
+            if isinstance(data, dict):
+                for key in ['v', 'V', 'voltage', 'Voltage', 'bat', 'battery']:
+                    if key in data:
+                        print()
+                        print(f"  VOLTAGE: {data[key]} V")
+                        break
+        except json.JSONDecodeError:
+            print(result.response_body)
+
+        print()
+        return 0
+    else:
+        logger.error(f"Failed to get battery info: {result.error_message}")
+        return 1
+
+
+def cmd_imu(args, logger):
+    """Get IMU sensor data."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    # CMD_GET_IMU_DATA
+    result = client.send_command({"T": 126}, retries=2)
+
+    if result.success:
+        print()
+        print("IMU Data:")
+        print("-" * 40)
+
+        try:
+            data = json.loads(result.response_body)
+            print(json.dumps(data, indent=2))
+        except json.JSONDecodeError:
+            print(result.response_body)
+
+        print()
+        return 0
+    else:
+        logger.error(f"Failed to get IMU data: {result.error_message}")
+        return 1
+
+
 def cmd_provision_sta(args, logger):
     """Provision the rover to connect to a Wi-Fi network."""
     ip = args.ip or DEFAULT_AP_IP
-    client = RoverClient(ip, logger=logger)
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(ip, logger=logger, verbose=verbose)
 
     logger.info("=" * 60)
     logger.info("WAVE ROVER STA PROVISIONING")
@@ -696,15 +1361,75 @@ def cmd_provision_sta(args, logger):
         sta_password=args.sta_password,
         ap_ssid=args.ap_ssid,
         ap_password=args.ap_password,
-        logger=logger
+        logger=logger,
+        reboot=not getattr(args, 'no_reboot', False)
     )
 
     return 0 if success else 1
 
 
+def cmd_wifi_info(args, logger):
+    """Query WiFi information from the rover."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    logger.info(f"Querying WiFi info from {args.ip}...")
+    info = get_wifi_info(client, logger)
+
+    if info:
+        logger.info(f"WiFi Info: {info}")
+        return 0
+    return 1
+
+
+def cmd_wifi_mode(args, logger):
+    """Set WiFi mode on boot."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    mode_names = {0: "OFF", 1: "AP only", 2: "STA only", 3: "AP+STA"}
+    logger.info(f"Setting WiFi mode to {args.mode} ({mode_names.get(args.mode, 'unknown')})...")
+
+    if set_wifi_mode(client, args.mode, logger):
+        return 0
+    return 1
+
+
+def cmd_reboot(args, logger):
+    """Reboot the ESP32."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    logger.info(f"Rebooting rover at {args.ip}...")
+    reboot_rover(client, logger)
+    logger.info("Reboot command sent. Rover should restart in a few seconds.")
+    return 0
+
+
+def cmd_send(args, logger):
+    """Send a raw JSON command to the rover."""
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
+
+    try:
+        command = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON: {e}")
+        return 1
+
+    logger.info(f"Sending command: {args.json}")
+    result = client.send_command(command)
+
+    logger.info(f"Status: HTTP {result.status_code}")
+    logger.info(f"Response: {result.response_body}")
+
+    return 0 if result.success else 1
+
+
 def cmd_run_motion_suite(args, logger):
     """Run the full motion test suite."""
-    client = RoverClient(args.ip, logger=logger)
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
     controller = MotionController(client, logger=logger)
 
     # Set up signal handler for Ctrl+C
@@ -753,7 +1478,8 @@ def cmd_run_motion_suite(args, logger):
 
 def cmd_stop(args, logger):
     """Send an emergency stop command."""
-    client = RoverClient(args.ip, logger=logger)
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
     controller = MotionController(client, logger=logger)
 
     logger.info(f"Sending E-STOP to {args.ip}...")
@@ -768,7 +1494,8 @@ def cmd_stop(args, logger):
 
 def cmd_move(args, logger):
     """Send a single motion command (for testing)."""
-    client = RoverClient(args.ip, logger=logger)
+    verbose = getattr(args, 'verbose', False)
+    client = RoverClient(args.ip, logger=logger, verbose=verbose)
     controller = MotionController(client, logger=logger)
 
     def signal_handler(sig, frame):
@@ -798,6 +1525,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Scan for rovers on your network
+  %(prog)s scan --subnet 192.168.1
+
+  # Scan the rover's AP network (default)
+  %(prog)s scan
+
   # Provision rover to your Wi-Fi (run while on UGV network)
   %(prog)s provision-sta --sta-ssid "MyWiFi" --sta-password "mypassword"
 
@@ -815,15 +1548,41 @@ Examples:
 
   # Manual move command
   %(prog)s move --ip 192.168.1.100 --left 0.1 --right 0.1 --duration 2
+
+  # Debug commands (with verbose logging)
+  %(prog)s -v wifi-info --ip 192.168.4.1
+  %(prog)s -v send --ip 192.168.4.1 --json '{"T":405}'
+  %(prog)s reboot --ip 192.168.4.1
 """
     )
-    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging (show all sent/received data)")
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Scan command
+    scan_parser = subparsers.add_parser("scan", help="Scan subnet to find rovers")
+    scan_parser.add_argument("--subnet", default="192.168.4",
+                             help="Subnet to scan (e.g., 192.168.1 or 192.168.4). Default: 192.168.4")
+    scan_parser.add_argument("--timeout", type=float, default=0.5,
+                             help="Timeout per IP in seconds (default: 0.5)")
+    scan_parser.add_argument("--workers", type=int, default=50,
+                             help="Number of concurrent connections (default: 50)")
 
     # Ping command
     ping_parser = subparsers.add_parser("ping", help="Test connectivity to rover")
     ping_parser.add_argument("--ip", required=True, help="Rover IP address")
+
+    # Status command (all info)
+    status_parser = subparsers.add_parser("status", help="Get all status info (battery, IMU, WiFi, etc.)")
+    status_parser.add_argument("--ip", default=DEFAULT_AP_IP, help=f"Rover IP address (default: {DEFAULT_AP_IP})")
+
+    # Battery command (quick)
+    battery_parser = subparsers.add_parser("battery", help="Get battery/chassis info")
+    battery_parser.add_argument("--ip", default=DEFAULT_AP_IP, help=f"Rover IP address (default: {DEFAULT_AP_IP})")
+
+    # IMU command
+    imu_parser = subparsers.add_parser("imu", help="Get IMU sensor data")
+    imu_parser.add_argument("--ip", default=DEFAULT_AP_IP, help=f"Rover IP address (default: {DEFAULT_AP_IP})")
 
     # Provision STA command
     provision_parser = subparsers.add_parser("provision-sta", help="Configure rover Wi-Fi (STA mode)")
@@ -832,14 +1591,42 @@ Examples:
     provision_parser.add_argument("--sta-password", required=True, help="Your Wi-Fi network password")
     provision_parser.add_argument("--ap-ssid", default=DEFAULT_AP_SSID, help=f"Rover AP SSID (default: {DEFAULT_AP_SSID})")
     provision_parser.add_argument("--ap-password", default=DEFAULT_AP_PASSWORD, help=f"Rover AP password (default: {DEFAULT_AP_PASSWORD})")
+    provision_parser.add_argument("--no-reboot", action="store_true", help="Don't reboot after provisioning")
 
-    # Run motion suite command
-    suite_parser = subparsers.add_parser("run-motion-suite", help="Run full motion test suite")
+    # WiFi info command
+    wifi_info_parser = subparsers.add_parser("wifi-info", help="Query current WiFi information")
+    wifi_info_parser.add_argument("--ip", required=True, help="Rover IP address")
+
+    # WiFi mode command
+    wifi_mode_parser = subparsers.add_parser("wifi-mode", help="Set WiFi mode on boot")
+    wifi_mode_parser.add_argument("--ip", required=True, help="Rover IP address")
+    wifi_mode_parser.add_argument("--mode", type=int, required=True, choices=[0, 1, 2, 3],
+                                   help="WiFi mode: 0=off, 1=AP, 2=STA, 3=AP+STA")
+
+    # Reboot command
+    reboot_parser = subparsers.add_parser("reboot", help="Reboot the ESP32")
+    reboot_parser.add_argument("--ip", required=True, help="Rover IP address")
+
+    # Send raw command
+    send_parser = subparsers.add_parser("send", help="Send a raw JSON command")
+    send_parser.add_argument("--ip", required=True, help="Rover IP address")
+    send_parser.add_argument("--json", required=True, help='JSON command (e.g., \'{"T":405}\')')
+
+    # Run motion suite command (interactive)
+    suite_parser = subparsers.add_parser("run-motion-suite", help="Run full motion test suite (interactive)")
     suite_parser.add_argument("--ip", required=True, help="Rover IP address (from OLED 'ST' line)")
     suite_parser.add_argument("--speed", type=float, default=DEFAULT_TEST_SPEED, help=f"Test speed in m/s (default: {DEFAULT_TEST_SPEED})")
     suite_parser.add_argument("--duration", type=float, default=DEFAULT_MOTION_DURATION, help=f"Duration per motion in seconds (default: {DEFAULT_MOTION_DURATION})")
     suite_parser.add_argument("--settle-delay", type=float, default=DEFAULT_SETTLE_DELAY, help=f"Delay between motions (default: {DEFAULT_SETTLE_DELAY})")
     suite_parser.add_argument("--non-interactive", action="store_true", help="Run without user prompts")
+
+    # Automated test suite (no user input)
+    auto_parser = subparsers.add_parser("auto-test", help="Run automated motion test (no user input)")
+    auto_parser.add_argument("--ip", default=DEFAULT_AP_IP, help=f"Rover IP address (default: {DEFAULT_AP_IP})")
+    auto_parser.add_argument("--speed", type=float, default=DEFAULT_TEST_SPEED, help=f"Test speed in m/s (default: {DEFAULT_TEST_SPEED})")
+    auto_parser.add_argument("--duration", type=float, default=DEFAULT_MOTION_DURATION, help=f"Duration per motion in seconds (default: {DEFAULT_MOTION_DURATION})")
+    auto_parser.add_argument("--settle-delay", type=float, default=DEFAULT_SETTLE_DELAY, help=f"Delay between motions (default: {DEFAULT_SETTLE_DELAY})")
+    auto_parser.add_argument("--skip-heartbeat", action="store_true", help="Skip the heartbeat validation test")
 
     # Stop command
     stop_parser = subparsers.add_parser("stop", help="Emergency stop")
@@ -862,9 +1649,18 @@ Examples:
 
     # Dispatch to command handler
     commands = {
+        "scan": cmd_scan,
         "ping": cmd_ping,
+        "status": cmd_status,
+        "battery": cmd_battery,
+        "imu": cmd_imu,
         "provision-sta": cmd_provision_sta,
+        "wifi-info": cmd_wifi_info,
+        "wifi-mode": cmd_wifi_mode,
+        "reboot": cmd_reboot,
+        "send": cmd_send,
         "run-motion-suite": cmd_run_motion_suite,
+        "auto-test": cmd_auto_test,
         "stop": cmd_stop,
         "move": cmd_move,
     }
